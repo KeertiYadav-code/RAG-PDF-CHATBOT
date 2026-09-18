@@ -1,178 +1,466 @@
-import streamlit as st
 import os
+import streamlit as st
+
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI
+)
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 
-# Load API Key
+# =========================================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
+if not GOOGLE_API_KEY:
+    st.error("GOOGLE_API_KEY not found in .env file.")
+    st.stop()
 
-# Page Setup
+
+# =========================================================
+# 2. PAGE CONFIGURATION
+# =========================================================
+
 st.set_page_config(
-    page_title="RAG PDF Chatbot",
-    page_icon="📚"
+    page_title="Multi-PDF RAG Chatbot",
+    page_icon="📚",
+    layout="wide"
 )
 
-st.title("📚 RAG PDF Chatbot")
-st.write("Upload your PDF and ask questions from it 🤖")
+st.title("📚 Multi-PDF RAG Chatbot")
+st.write(
+    "Upload multiple PDF documents and ask questions from them using RAG 🤖"
+)
 
 
-# PDF Text Extraction
-def get_pdf_text(pdf):
+# =========================================================
+# 3. PDF TEXT EXTRACTION
+# =========================================================
 
-    text = ""
+def get_pdf_documents(pdf_files):
 
-    pdf_reader = PdfReader(pdf)
+    documents = []
 
-    for page in pdf_reader.pages:
-        text += page.extract_text()
+    for pdf in pdf_files:
 
-    return text
+        pdf_reader = PdfReader(pdf)
+
+        for page_number, page in enumerate(pdf_reader.pages, start=1):
+
+            text = page.extract_text()
+
+            if text and text.strip():
+
+                documents.append({
+                    "text": text,
+                    "source": pdf.name,
+                    "page": page_number
+                })
+
+    return documents
 
 
+# =========================================================
+# 4. TEXT CHUNKING
+# =========================================================
 
-# Text Chunking
-def get_text_chunks(text):
+def get_text_chunks(documents):
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
     )
 
-    chunks = splitter.split_text(text)
+    chunks = []
+
+    for document in documents:
+
+        text_chunks = splitter.split_text(document["text"])
+
+        for chunk in text_chunks:
+
+            chunks.append({
+                "text": chunk,
+                "source": document["source"],
+                "page": document["page"]
+            })
 
     return chunks
 
 
+# =========================================================
+# 5. CREATE FAISS VECTOR DATABASE
+# =========================================================
 
-# Create Vector Database
 def create_vector_store(chunks):
 
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001"
+       model="gemini-embedding-001",
+        google_api_key=GOOGLE_API_KEY
     )
 
+    texts = []
+    metadatas = []
+
+    for chunk in chunks:
+
+        texts.append(chunk["text"])
+
+        metadatas.append({
+            "source": chunk["source"],
+            "page": chunk["page"]
+        })
+
     vector_store = FAISS.from_texts(
-        chunks,
-        embedding=embeddings
+        texts,
+        embedding=embeddings,
+        metadatas=metadatas
     )
 
     vector_store.save_local("faiss_index")
 
+    return vector_store
 
 
-# Create Gemini Chain
-def get_chain():
+# =========================================================
+# 6. GEMINI MODEL
+# =========================================================
+
+def get_llm():
+    model = ChatGoogleGenerativeAI(
+        model="gemini-3.1-flash-lite",
+        temperature=0.3,
+        google_api_key=GOOGLE_API_KEY
+    )
+    return model
+
+# =========================================================
+# 7. PROMPT
+# =========================================================
+
+def get_prompt():
 
     prompt = """
-    Answer the question using the given context.
-    If the answer is not available in the context,
-    say "Answer not available in the document".
+You are a document-based AI assistant.
 
-    Context:
-    {context}
+You have access to information retrieved from multiple PDF documents.
 
-    Question:
-    {question}
+Answer the user's question using ONLY the information provided
+in the context.
 
-    Answer:
-    """
+IMPORTANT RULES:
 
-    model = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        temperature=0.3
-    )
+1. The context may contain information from different PDF files.
+2. First identify which information belongs to the person/resume.
+3. Then identify which information belongs to the internship/task document.
+4. If the question asks whether a person's skills match the
+   requirements of a task, compare BOTH sets of information.
+5. Clearly mention:
+   - Skills the person possesses
+   - Skills/requirements needed for the task
+   - Which requirements match
+   - Which requirements are not found in the person's document
+6. Do not assume that a skill exists unless it is explicitly
+   present in the uploaded documents.
+7. Do not use outside knowledge.
+8. If the documents do not contain enough information to make
+   the comparison, say:
+   "Answer not available in the uploaded documents."
 
+Context:
+{context}
 
-    prompt_template = PromptTemplate(
+Question:
+{question}
+
+Answer:
+"""
+
+    return PromptTemplate(
         template=prompt,
-        input_variables=["context","question"]
+        input_variables=["context", "question"]
     )
 
 
-    chain = load_qa_chain(
-        model,
-        chain_type="stuff",
-        prompt=prompt_template
-    )
+# =========================================================
+# 8. ASK QUESTION
+# =========================================================
 
-    return chain
+# =========================================================
+# 8. ASK QUESTION
+# =========================================================
 
-
-
-# Ask Question
 def ask_question(question):
 
+    # Create embeddings
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001"
+        model="gemini-embedding-001",
+        google_api_key=GOOGLE_API_KEY
     )
 
-    database = FAISS.load_local(
+    # Load FAISS vector database
+    vector_store = FAISS.load_local(
         "faiss_index",
         embeddings,
         allow_dangerous_deserialization=True
     )
 
-
-    docs = database.similarity_search(question)
-
-
-    chain = get_chain()
-
-
-    response = chain(
-        {
-            "input_documents": docs,
-            "question": question
-        },
-        return_only_outputs=True
+    # Retrieve relevant chunks
+    docs = vector_store.similarity_search(
+        question,
+        k=10
     )
 
+    # If no relevant documents found
+    if not docs:
+        return (
+            "Answer not available in the uploaded documents.",
+            []
+        )
 
-    st.write(response["output_text"])
+    # Combine retrieved documents
+    context = "\n\n".join(
+        f"Source: {doc.metadata.get('source', 'Unknown')}\n"
+        f"Page: {doc.metadata.get('page', 'Unknown')}\n"
+        f"Content:\n{doc.page_content}"
+        for doc in docs
+    )
+
+    # Create prompt
+    prompt = get_prompt()
+
+    final_prompt = prompt.format(
+        context=context,
+        question=question
+    )
+
+    # Gemini
+    llm = get_llm()
+
+    response = llm.invoke(final_prompt)
+
+    # Convert Gemini response into clean text
+    if isinstance(response.content, str):
+
+        answer = response.content
+
+    else:
+
+        answer = "".join(
+            item.get("text", "")
+            for item in response.content
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+        )
+
+    # Remove duplicate sources
+    sources = []
+
+    for doc in docs:
+
+        source = doc.metadata.get(
+            "source",
+            "Unknown"
+        )
+
+        page = doc.metadata.get(
+            "page",
+            "Unknown"
+        )
+
+        source_info = f"{source} — Page {page}"
+
+        if source_info not in sources:
+            sources.append(source_info)
+
+    return answer, sources
+
+# =========================================================
+# 9. SESSION STATE
+# =========================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
 
 
+# =========================================================
+# 10. SIDEBAR
+# =========================================================
 
-# Sidebar
 with st.sidebar:
 
-    st.header("Upload PDF")
+    st.header("📄 Upload Documents")
 
-    pdf = st.file_uploader(
-        "Choose PDF",
-        type="pdf"
+    pdf_files = st.file_uploader(
+        "Choose PDF files",
+        type=["pdf"],
+        accept_multiple_files=True
     )
 
+    st.divider()
 
-    if st.button("Process PDF"):
+    process_button = st.button(
+        "🚀 Process PDFs",
+        use_container_width=True
+    )
 
-        with st.spinner("Processing..."):
+    if process_button:
 
-            text = get_pdf_text(pdf)
+        if not pdf_files:
 
-            chunks = get_text_chunks(text)
+            st.warning("Please upload at least one PDF.")
 
-            create_vector_store(chunks)
+        else:
 
-            st.success("PDF Processed Successfully ✅")
+            with st.spinner("Processing PDFs..."):
+
+                try:
+
+                    # Extract text
+                    documents = get_pdf_documents(pdf_files)
+
+                    if not documents:
+
+                        st.error(
+                            "No readable text found in the uploaded PDFs."
+                        )
+
+                    else:
+
+                        # Chunk documents
+                        chunks = get_text_chunks(documents)
+
+                        # Create vector database
+                        create_vector_store(chunks)
+
+                        # Clear previous chat
+                        st.session_state.messages = []
+
+                        st.success(
+                            f"Successfully processed "
+                            f"{len(pdf_files)} PDF(s)!"
+                        )
+
+                        st.info(
+                            f"Created {len(chunks)} text chunks."
+                        )
+
+                except Exception as e:
+
+                    st.error(
+                        f"Error while processing PDFs: {str(e)}"
+                    )
+
+    st.divider()
+
+    if st.button(
+        "🗑️ Clear Chat",
+        use_container_width=True
+    ):
+
+        st.session_state.messages = []
+
+        st.rerun()
 
 
+# =========================================================
+# 11. DISPLAY PREVIOUS CHAT
+# =========================================================
 
-question = st.text_input(
-    "Ask a question from your PDF"
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+
+        st.markdown(message["content"])
+
+        if (
+            message["role"] == "assistant"
+            and message.get("sources")
+        ):
+
+            st.markdown("**📚 Sources:**")
+
+            for source in message["sources"]:
+
+                st.caption(f"📄 {source}")
+
+
+# =========================================================
+# 12. USER QUESTION
+# =========================================================
+
+question = st.chat_input(
+    "Ask a question from your uploaded PDFs..."
 )
 
 
 if question:
 
-    ask_question(question)
+    # Check whether vector database exists
+    if not os.path.exists("faiss_index"):
+
+        st.warning(
+            "Please upload and process your PDFs first."
+        )
+
+    else:
+
+        # Display user question
+        with st.chat_message("user"):
+
+            st.markdown(question)
+
+        # Save user message
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
+
+        # Generate answer
+        with st.chat_message("assistant"):
+
+            with st.spinner("Searching documents..."):
+
+                try:
+
+                    answer, sources = ask_question(question)
+
+                    st.markdown(answer)
+
+                    # Display sources
+                    if sources:
+
+                        st.markdown("**📚 Sources:**")
+
+                        for source in sources:
+
+                            st.caption(f"📄 {source}")
+
+                    # Save assistant response
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources
+                    })
+
+                except Exception as e:
+
+                    error_message = f"Error: {str(e)}"
+
+                    st.error(error_message)
+
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": error_message,
+                        "sources": []
+                    })
